@@ -1,0 +1,19 @@
+resources:
+  accelerators: tpu-v6e-4 #
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e # optional
+file_mounts:
+  ~/.ssh/id_rsa: ~/.ssh/id_rsa
+setup: |
+  chmod 600 ~/.ssh/id_rsa
+  rm ~/.ssh/config
+  conda create -n sglang-jax python=3.12
+  sudo apt install -y aria2
+  git clone https://github.com/weinanliu/sglang-jax.git
+  cd sglang-jax
+  conda activate sglang-jax
+  pip install -e "python[all]"
+  sleep infinity
+
+
