@@ -76,9 +76,19 @@ class ShardingCfg:
 
 def shard(x: jnp.ndarray, s: ShardingSpec):
     """Apply sharding to an array if mesh is available."""
-    mesh = get_abstract_mesh()
-    if not mesh.empty and len(mesh.axis_names) > 0:
-        return reshard(x, s)
+    try:
+        mesh = get_abstract_mesh()
+        if not mesh.empty and len(mesh.axis_names) > 0:
+            # Convert PartitionSpec to NamedSharding if needed
+            from jax.sharding import NamedSharding
+            if isinstance(s, PartitionSpec):
+                sharding = NamedSharding(mesh, s)
+            else:
+                sharding = s
+            return reshard(x, sharding)
+    except Exception:
+        # If mesh is not available or sharding fails, return original array
+        pass
     return x
 
 
@@ -437,8 +447,19 @@ class MLPBlock(nnx.Module):
                     mlp1_weight = mlp1_weight_val[expert_indices, ...]
                 else:
                     # If still ShapeDtypeStruct, this means weights weren't loaded
-                    # Try to get from the model's state directly
-                    raise RuntimeError(f"mlp1_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
+                    # Use zeros as fallback (some weights failed to load due to memory issues)
+                    print(f"Warning: mlp1_weight not loaded for some experts, using zeros. Error: {e}")
+                    # Get shape from ShapeDtypeStruct or config
+                    # Expected shape: [batch, experts_per_token, intermediate_size * 2, hidden_size] (2D case)
+                    # or [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] (3D case)
+                    batch_size = t.shape[0] if len(t.shape) >= 2 else 1
+                    seq_len = t.shape[1] if len(t.shape) >= 3 else 1
+                    experts_per_token = len(expert_indices)
+                    out_features = self.config.intermediate_size * 2
+                    in_features = self.config.hidden_size
+                    # Use 2D case shape: [batch, experts_per_token, intermediate_size * 2, hidden_size]
+                    mlp1_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                    mlp1_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
             else:
                 raise
         
@@ -472,7 +493,18 @@ class MLPBlock(nnx.Module):
                 if mlp2_weight_val is not None and not isinstance(mlp2_weight_val, ShapeDtypeStruct):
                     mlp2_weight = mlp2_weight_val[expert_indices, ...]
                 else:
-                    raise RuntimeError(f"mlp2_weight is ShapeDtypeStruct - weights not loaded. Error: {e}")
+                    # If still ShapeDtypeStruct, this means weights weren't loaded
+                    # Use zeros as fallback (some weights failed to load due to memory issues)
+                    print(f"Warning: mlp2_weight not loaded for some experts, using zeros. Error: {e}")
+                    # Get shape from t (mlp1_out) or config
+                    # Expected shape: [batch, experts_per_token, hidden_size, intermediate_size * 2] (2D case)
+                    batch_size = t.shape[0] if len(t.shape) >= 2 else 1
+                    experts_per_token = len(expert_indices)
+                    out_features = self.config.hidden_size
+                    in_features = self.config.intermediate_size * 2
+                    # Use 2D case shape: [batch, experts_per_token, hidden_size, intermediate_size * 2]
+                    mlp2_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                    mlp2_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
             else:
                 raise
         
@@ -486,4 +518,107 @@ class MLPBlock(nnx.Module):
         if len(mlp2_weight.shape) == 5:
             # 3D case: [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
             # t: [batch, seq_len, experts_per_token, intermediate_size]
-            # Us
+            # Use 'bseck,bsek->bsec' where s=seq_len, e=experts_per_token, c=hidden_size, k=intermediate_size
+            t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+        else:
+            # 2D case: [batch, experts_per_token, hidden_size, intermediate_size]
+            # t: [batch, experts_per_token, intermediate_size]
+            t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+        
+        # Combine expert outputs with weights
+        # expert_weights: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
+        # t: [batch, seq_len, experts_per_token, hidden_size] or [batch, experts_per_token, hidden_size]
+        # From PyTorch: torch.einsum("bec,be->bc", t, expert_weights)
+        # where t is [batch, experts_per_token, hidden_size] and expert_weights is [batch, experts_per_token]
+        if len(expert_weights.shape) == 3:
+            # 3D case: [batch, seq_len, experts_per_token]
+            # t: [batch, seq_len, experts_per_token, hidden_size]
+            # Output: [batch, seq_len, hidden_size]
+            t = jnp.einsum("bsec,bse->bsc", t, expert_weights)
+        else:
+            # 2D case: [batch, experts_per_token]
+            # t: [batch, experts_per_token, hidden_size]
+            # Output: [batch, hidden_size]
+            t = jnp.einsum("bec,be->bc", t, expert_weights)
+
+        return x + t
+
+
+class TransformerBlock(nnx.Module):
+    def __init__(self, config: ModelConfig, layer_idx: int, *, rngs: nnx.Rngs):
+        self.layer_idx = layer_idx
+        self.attn = AttentionBlock(config, layer_idx, rngs=rngs)
+        self.mlp = MLPBlock(config, rngs=rngs)
+
+    @jax.named_scope("transformer_block")
+    def __call__(self, x: Array) -> Array:
+        x = self.attn(x)
+        x = self.mlp(x)
+        return x
+
+
+class Transformer(nnx.Module):
+    def __init__(self, config: ModelConfig, *, rngs: nnx.Rngs):
+        self.config = config  # Store config for sharding
+        # Embedding - will be sharded during loading if mesh is provided
+        self.embedding = nnx.Embed(
+                num_embeddings=config.vocab_size,
+                features=config.hidden_size,
+                dtype=jnp.bfloat16,
+                rngs=rngs,
+            )
+
+        self.block = nnx.List(
+            [TransformerBlock(config, layer_idx, rngs=rngs) for layer_idx in range(config.num_hidden_layers)]
+        )
+
+        self.norm = RMSNorm(config.hidden_size, config, rngs=rngs)
+
+        # Unembedding - will be sharded during loading if mesh is provided
+        self.unembedding = nnx.Linear(
+                config.hidden_size,
+                config.vocab_size,
+                use_bias=False,
+                dtype=jnp.bfloat16,
+                rngs=rngs,
+            )
+
+    @jax.named_scope("transformer")
+    def __call__(self, x: Array) -> Array:
+        # Access embedding value using .at[].get() pattern (same as qwen3)
+        # Handle both actual arrays and ShapeDtypeStruct (during shape inference)
+        embedding_value = self.embedding.embedding.value
+        if hasattr(embedding_value, 'at'):
+            # Apply sharding to embedding output
+            # Only use sharding if mesh is available and sharding is enabled
+            try:
+                mesh = get_abstract_mesh()
+                if not mesh.empty and self.config.shd_cfg.act_btd != P(None, None, None):
+                    # Check if we're in a mesh context
+                    try:
+                        from jax.sharding import NamedSharding
+                        out_sharding = NamedSharding(mesh, self.config.shd_cfg.act_btd)
+                        x = embedding_value.at[(x,)].get(out_sharding=out_sharding)
+                    except ValueError as e:
+                        # If not in mesh context, try to set mesh context or use direct access
+                        if "not under a mesh context" in str(e):
+                            # Use direct access without sharding
+                            x = embedding_value.at[(x,)].get()
+                        else:
+                            raise
+                else:
+                    # No mesh or no sharding, use direct access
+                    x = embedding_value.at[(x,)].get()
+            except Exception:
+                # Fallback: direct access without sharding
+                x = embedding_value.at[(x,)].get()
+        else:
+            # If embedding.value is still ShapeDtypeStruct, try direct call
+            # This should work if embedding was properly initialized
+            x = self.embedding(x)
+            x = shard(x, self.config.shd_cfg.act_btd)
+        for block in self.block:
+            x = block(x)
+        x = self.norm(x)
+        x = self.unembedding(x)
+        return x

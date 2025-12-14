@@ -21,3 +21,4 @@ echo "  - Conda环境: sglang-jax"
 echo "  - PYTHONPATH: $PYTHONPATH"
 echo "  - JAX编译缓存: $JAX_COMPILATION_CACHE_DIR"
 
+

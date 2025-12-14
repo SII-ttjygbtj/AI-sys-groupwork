@@ -64,3 +64,4 @@ echo "=== 模型路径信息 ==="
 echo "gpt-oss-20b 路径: $(pwd)/gpt-oss-20b"
 echo "gpt-oss-120b 路径: $(pwd)/gpt-oss-120b"
 
+

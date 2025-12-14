@@ -28,3 +28,4 @@ echo "提示: 按Ctrl+C停止当前测试，或等待完成"
 echo "完成后可以运行: TP_SIZE=2 bash go_gptoss.sh"
 echo "              TP_SIZE=4 bash go_gptoss.sh"
 
+

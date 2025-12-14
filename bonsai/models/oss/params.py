@@ -361,7 +361,46 @@ def create_model_from_checkpoint(
                 if is_mxfp4:
                     continue  # Skip individual MXFP4 tensors, process them in pairs
 
-                tensor = jnp.array(sf.get_tensor(torch_key))
+                # Load non-MXFP4 weights directly (these are smaller)
+                # Use numpy first, then convert to JAX with sharding if mesh is available
+                import numpy as np
+                tensor_np = np.array(sf.get_tensor(torch_key))
+                tensor = jnp.array(tensor_np, dtype=jnp.bfloat16)
+                
+                # Apply sharding if mesh is available (for non-MXFP4 weights)
+                if mesh is not None and not mesh.empty:
+                    # Determine sharding based on weight type and rank
+                    from jax import P
+                    from jax.sharding import NamedSharding
+                    
+                    tensor_rank = len(tensor.shape)
+                    
+                    # Choose sharding spec based on rank and weight type
+                    if tensor_rank == 1:
+                        # 1D tensors (bias, norm scale, etc.)
+                        if "norm" in torch_key or "scale" in torch_key:
+                            sharding_spec = P("tp")  # Shard the dimension
+                        else:
+                            # For 1D tensors that shouldn't be sharded, use None
+                            sharding_spec = P(None)
+                    elif tensor_rank == 2:
+                        # 2D tensors (linear weights, embeddings)
+                        if "embedding" in torch_key or "embed" in torch_key:
+                            sharding_spec = P("tp", None)  # Shard vocab dimension
+                        elif "qkv" in torch_key or "gate" in torch_key or "out" in torch_key or "o_proj" in torch_key:
+                            sharding_spec = P(None, "tp")  # Shard hidden dimension
+                        else:
+                            sharding_spec = P(None, "tp")  # Default: shard second dimension
+                    else:
+                        # Higher rank tensors - don't shard for now
+                        sharding_spec = P(*([None] * tensor_rank))
+                    
+                    # Only apply sharding if spec is not all None
+                    if sharding_spec != P(*([None] * tensor_rank)):
+                        sharding = NamedSharding(mesh, sharding_spec)
+                        tensor = jax.device_put(tensor, sharding)
+                
+                del tensor_np  # Free numpy array
 
                 # Handle Q, K, V separately - collect them first, merge later
                 qkv_match = re.match(r"model\.layers\.([0-9]+)\.self_attn\.(q|k|v)_proj\.weight", torch_key)
@@ -432,4 +471,141 @@ def create_model_from_checkpoint(
             # Concatenate along first dimension: [qkv_dim_total, hidden_size]
             qkv = jnp.concatenate([q, k, v], axis=0)
             # QKV is now [qkv_dim, hidden_size]
-            # nnx.Linear(in_features, out_features) has kernel sha
+            # nnx.Linear(in_features, out_features) has kernel shape [out_features, in_features]
+            # So we need to transpose: [qkv_dim, hidden_size] -> [hidden_size, qkv_dim] is wrong
+            # Actually, nnx.Linear expects kernel in [out_features, in_features] format
+            # So if checkpoint has [qkv_dim, hidden_size], we keep it as is
+            jax_key = f"block.{layer_idx}.attn.qkv.kernel"
+            keys = [_stoi(k) for k in jax_key.split(".")]
+            transform_val = _get_key_and_transform_mapping(cfg)[r"model\.layers\.([0-9]+)\.self_attn\.q_proj\.weight"][1].value
+            try:
+                _assign_weights(keys, qkv, state_dict, f"layer_{layer_idx}_qkv", transform_val)
+            except Exception as e:
+                conversion_errors.append(f"Failed to assign QKV for layer {layer_idx}: {type(e).__name__}: {e}")
+
+    # Process MXFP4 tensor pairs - process layer by layer to save memory
+    # Group by layer to process one layer at a time
+    mxfp4_by_layer = {}
+    for base_name, (blocks_key, scales_key) in mxfp4_pairs.items():
+        pattern_match = re.match(r"block\.([0-9]+)\.mlp\.(mlp1_weight|mlp2_weight)", base_name)
+        if pattern_match:
+            layer_idx = int(pattern_match.group(1))
+            if layer_idx not in mxfp4_by_layer:
+                mxfp4_by_layer[layer_idx] = []
+            mxfp4_by_layer[layer_idx].append((base_name, blocks_key, scales_key))
+    
+    # Process one layer at a time
+    for layer_idx in sorted(mxfp4_by_layer.keys()):
+        print(f"Loading layer {layer_idx} MXFP4 weights...")
+        for base_name, blocks_key, scales_key in mxfp4_by_layer[layer_idx]:
+            # Try to load both blocks and scales
+            blocks_tensor = None
+            scales_tensor = None
+            
+            for f in files:
+                with safetensors.safe_open(f, framework="numpy") as sf:
+                    if blocks_key in sf.keys():
+                        # Load as numpy directly (don't convert to JAX yet)
+                        import numpy as np
+                        blocks_tensor = np.array(sf.get_tensor(blocks_key))
+                    if scales_key in sf.keys():
+                        scales_tensor = np.array(sf.get_tensor(scales_key))
+            
+            if blocks_tensor is not None and scales_tensor is not None:
+                # Convert MXFP4 to full precision using numpy (all on CPU)
+                try:
+                    import numpy as np
+                    # Convert using numpy (all operations on CPU, no device memory)
+                    lut = np.array(FP4_VALUES, dtype=np.float32)
+                    *prefix_shape, G, B = blocks_tensor.shape
+                    rows_total = math.prod(prefix_shape) * G
+                    
+                    blocks_flat = blocks_tensor.reshape(rows_total, B)
+                    scales_flat = scales_tensor.reshape(rows_total, 1).astype(np.int32) - 127
+                    
+                    idx_lo = (blocks_flat & 0x0F).astype(np.int64)
+                    idx_hi = (blocks_flat >> 4).astype(np.int64)
+                    
+                    sub_lo = lut[idx_lo]
+                    sub_hi = lut[idx_hi]
+                    
+                    sub = np.empty((rows_total, B * 2), dtype=np.float32)
+                    sub[:, 0::2] = sub_lo
+                    sub[:, 1::2] = sub_hi
+                    
+                    exp = scales_flat.astype(np.float32)
+                    sub = sub * np.power(2.0, exp)
+                    # Convert to bfloat16 in numpy (if available) or keep as float32
+                    try:
+                        sub = sub.astype(np.float32)  # Keep as float32, convert to bfloat16 in JAX
+                    except:
+                        pass
+                    
+                    full_tensor_np = sub.reshape(*prefix_shape, G, B * 2).reshape(*prefix_shape, G * B * 2)
+                    
+                    # Now convert to JAX and shard in one step to minimize device memory
+                    # Determine sharding spec first
+                    from jax import P
+                    from jax.sharding import NamedSharding
+                    sharding_spec = P("tp", None, None)  # [num_experts, ...] shard experts
+                    
+                    if mesh is not None and not mesh.empty:
+                        # Create sharding
+                        sharding = NamedSharding(mesh, sharding_spec)
+                        # Convert numpy to JAX and shard directly (minimizes intermediate memory)
+                        # Use jax.device_put with sharding to directly place on devices
+                        full_tensor = jax.device_put(
+                            jnp.array(full_tensor_np, dtype=jnp.bfloat16),
+                            sharding
+                        )
+                    else:
+                        # No mesh, just convert to JAX on default device
+                        full_tensor = jnp.array(full_tensor_np, dtype=jnp.bfloat16)
+                    
+                    # Clear numpy arrays to free memory
+                    del blocks_tensor, scales_tensor, full_tensor_np, sub, sub_lo, sub_hi
+                    gc.collect()
+                    
+                except Exception as e:
+                    # Fallback: try direct conversion (may fail on large tensors)
+                    print(f"Warning: CPU conversion failed for {base_name}: {e}")
+                    # Don't try direct conversion as it will definitely fail
+                    conversion_errors.append(f"Failed to convert MXFP4 {base_name}: {e}")
+                    continue
+                
+                # Determine the transform and target key
+                pattern_match = re.match(r"block\.([0-9]+)\.mlp\.(mlp1_weight|mlp2_weight)", base_name)
+                if pattern_match:
+                    weight_type = pattern_match.group(2)
+                    # Find the transform
+                    for pattern, (repl, transform) in key_mapping.items():
+                        if re.match(pattern, f"block.{layer_idx}.mlp.{weight_type}"):
+                            # Extract the target key (without .blocks suffix)
+                            target_base = base_name.replace(".blocks", "")
+                            keys = [_stoi(k) for k in target_base.split(".")]
+                            transform_val = transform.value if hasattr(transform, 'value') else transform
+                            try:
+                                _assign_weights(keys, full_tensor, state_dict, base_name, transform_val)
+                                # Clear the tensor after assignment
+                                del full_tensor
+                                gc.collect()
+                            except Exception as e:
+                                conversion_errors.append(f"Failed to assign MXFP4 {base_name}: {type(e).__name__}: {e}")
+                            break
+        
+        # Force garbage collection after each layer
+        gc.collect()
+        print(f"Layer {layer_idx} weights loaded and sharded")
+
+    if conversion_errors:
+        print("Warning: Some weights could not be converted:")
+        for err in conversion_errors[:10]:  # Show first 10 errors
+            print(f"  {err}")
+        if len(conversion_errors) > 10:
+            print(f"  ... and {len(conversion_errors) - 10} more errors")
+
+    # Reconstruct model from state_dict (pure dict)
+    # Use nnx.merge with state_dict directly (like qwen3)
+    model = nnx.merge(graph_def, state_dict)
+    
+    return model

@@ -33,3 +33,4 @@ echo "  export PYTHONPATH=/home/gcpuser/sky_workdir/sglang-jax:\$PYTHONPATH"
 echo "  cd /home/gcpuser/AI-sys-groupwork/sglang_jax"
 echo "  TP_SIZE=1 python go_gptoss.py"
 
+
