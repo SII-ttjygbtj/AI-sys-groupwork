@@ -34,3 +34,24 @@ sglang_jax/tp_test_results/
 # JAX编译缓存
 /tmp/jit_cache*/
 /tmp/jax_compilation_cache*/
+
+# 大文件和模型权重
+sglang_jax/gpt-oss-*/
+sglang_jax/qwen-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# 日志文件
+*.log
+sglang_jax/*.log
+
+# 测试结果
+sglang_jax/tp_test_results/
+*.log
+
+# JAX编译缓存
+/tmp/jit_cache*/
+/tmp/jax_compilation_cache*/

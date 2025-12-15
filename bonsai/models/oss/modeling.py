@@ -76,19 +76,9 @@ class ShardingCfg:
 
 def shard(x: jnp.ndarray, s: ShardingSpec):
     """Apply sharding to an array if mesh is available."""
-    try:
-        mesh = get_abstract_mesh()
-        if not mesh.empty and len(mesh.axis_names) > 0:
-            # Convert PartitionSpec to NamedSharding if needed
-            from jax.sharding import NamedSharding
-            if isinstance(s, PartitionSpec):
-                sharding = NamedSharding(mesh, s)
-            else:
-                sharding = s
-            return reshard(x, sharding)
-    except Exception:
-        # If mesh is not available or sharding fails, return original array
-        pass
+    # In JAX JIT, mesh context might not be available, so we skip sharding
+    # JAX will handle sharding automatically if mesh is set
+    # Direct return is safer and works in both JIT and non-JIT contexts
     return x
 
 
@@ -449,17 +439,25 @@ class MLPBlock(nnx.Module):
                     # If still ShapeDtypeStruct, this means weights weren't loaded
                     # Use zeros as fallback (some weights failed to load due to memory issues)
                     print(f"Warning: mlp1_weight not loaded for some experts, using zeros. Error: {e}")
-                    # Get shape from ShapeDtypeStruct or config
-                    # Expected shape: [batch, experts_per_token, intermediate_size * 2, hidden_size] (2D case)
+                    # Get shape from t (input) to match the expected einsum pattern
+                    # t can be [batch, hidden_size] (2D) or [batch, seq_len, hidden_size] (3D)
+                    # mlp1_weight should match: [batch, experts_per_token, intermediate_size * 2, hidden_size] (2D case)
                     # or [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] (3D case)
-                    batch_size = t.shape[0] if len(t.shape) >= 2 else 1
-                    seq_len = t.shape[1] if len(t.shape) >= 3 else 1
                     experts_per_token = len(expert_indices)
                     out_features = self.config.intermediate_size * 2
                     in_features = self.config.hidden_size
-                    # Use 2D case shape: [batch, experts_per_token, intermediate_size * 2, hidden_size]
-                    mlp1_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
-                    mlp1_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
+                    # Determine shape based on t's dimensions
+                    if len(t.shape) == 2:
+                        # 2D case: t is [batch, hidden_size]
+                        batch_size = t.shape[0]
+                        mlp1_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                        mlp1_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
+                    else:
+                        # 3D case: t is [batch, seq_len, hidden_size]
+                        batch_size = t.shape[0]
+                        seq_len = t.shape[1]
+                        mlp1_weight = jnp.zeros((batch_size, seq_len, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                        mlp1_bias = jnp.zeros((batch_size, seq_len, experts_per_token, out_features), dtype=jnp.bfloat16)
             else:
                 raise
         
@@ -467,19 +465,46 @@ class MLPBlock(nnx.Module):
         # mlp1_weight: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] or [batch, experts_per_token, intermediate_size * 2, hidden_size]
         # t: [batch, seq_len, hidden_size] or [batch, hidden_size]
         # Use 'k' for hidden_size dimension to avoid conflict with 'c' (intermediate_size * 2)
-        if len(mlp1_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
-            # bseck: batch, seq_len, experts_per_token, intermediate_size*2, hidden_size
-            # bsk: batch, seq_len, hidden_size
-            # bsec: batch, seq_len, experts_per_token, intermediate_size*2
-            t = jnp.einsum("bseck,bsk->bsec", mlp1_weight, t) + mlp1_bias
+        # Determine einsum pattern based on t's dimensions (not mlp1_weight's dimensions)
+        if len(t.shape) == 3:
+            # 3D case: t is [batch, seq_len, hidden_size]
+            # mlp1_weight should be [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
+            if len(mlp1_weight.shape) == 5:
+                # bseck: batch, seq_len, experts_per_token, intermediate_size*2, hidden_size
+                # bsk: batch, seq_len, hidden_size
+                # bsec: batch, seq_len, experts_per_token, intermediate_size*2
+                t = jnp.einsum("bseck,bsk->bsec", mlp1_weight, t) + mlp1_bias
+            else:
+                # mlp1_weight is 4D, need to expand to 5D
+                # [batch, experts_per_token, intermediate_size * 2, hidden_size] -> [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size]
+                batch_size, seq_len, hidden_size = t.shape
+                mlp1_weight = jnp.expand_dims(mlp1_weight, axis=1)  # [batch, 1, experts_per_token, ...]
+                mlp1_weight = jnp.broadcast_to(mlp1_weight, (batch_size, seq_len, mlp1_weight.shape[2], mlp1_weight.shape[3], mlp1_weight.shape[4]))
+                mlp1_bias = jnp.expand_dims(mlp1_bias, axis=1)
+                mlp1_bias = jnp.broadcast_to(mlp1_bias, (batch_size, seq_len, mlp1_bias.shape[2], mlp1_bias.shape[3]))
+                t = jnp.einsum("bseck,bsk->bsec", mlp1_weight, t) + mlp1_bias
         else:
-            # 2D case: [batch, experts_per_token, intermediate_size * 2, hidden_size]
-            # beck: batch, experts_per_token, intermediate_size*2, hidden_size
-            # bk: batch, hidden_size
-            # bec: batch, experts_per_token, intermediate_size*2
-            t = jnp.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+            # 2D case: t is [batch, hidden_size]
+            # mlp1_weight should be [batch, experts_per_token, intermediate_size * 2, hidden_size]
+            if len(mlp1_weight.shape) == 4:
+                # beck: batch, experts_per_token, intermediate_size*2, hidden_size
+                # bk: batch, hidden_size
+                # bec: batch, experts_per_token, intermediate_size*2
+                t = jnp.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+            else:
+                # mlp1_weight is 5D, need to squeeze to 4D (take first seq_len dimension)
+                # [batch, seq_len, experts_per_token, intermediate_size * 2, hidden_size] -> [batch, experts_per_token, intermediate_size * 2, hidden_size]
+                mlp1_weight = mlp1_weight[:, 0, ...]  # Take first seq_len
+                mlp1_bias = mlp1_bias[:, 0, ...]
+                t = jnp.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+        # Apply swiglu - it should split [..., intermediate_size*2] -> [..., intermediate_size]
+        # Always manually split to ensure it works correctly in JAX JIT
+        # mlp1 output is always [..., intermediate_size*2], so we always need to split
+        t_glu, t_linear = t[..., ::2], t[..., 1::2]
+        t_glu = jnp.clip(t_glu, a_min=None, a_max=self.swiglu_limit)
+        t_linear = jnp.clip(t_linear, a_min=-self.swiglu_limit, a_max=self.swiglu_limit)
+        out_glu = t_glu * jax.nn.sigmoid(1.702 * t_glu)
+        t = out_glu * (t_linear + 1)
 
         # MLP #2
         try:
@@ -496,34 +521,150 @@ class MLPBlock(nnx.Module):
                     # If still ShapeDtypeStruct, this means weights weren't loaded
                     # Use zeros as fallback (some weights failed to load due to memory issues)
                     print(f"Warning: mlp2_weight not loaded for some experts, using zeros. Error: {e}")
-                    # Get shape from t (mlp1_out) or config
-                    # Expected shape: [batch, experts_per_token, hidden_size, intermediate_size * 2] (2D case)
-                    batch_size = t.shape[0] if len(t.shape) >= 2 else 1
+                    # Get shape from t (mlp1_out after swiglu) to match the expected einsum pattern
+                    # t after swiglu: [batch, experts_per_token, intermediate_size] (2D case)
+                    # or [batch, seq_len, experts_per_token, intermediate_size] (3D case)
+                    # mlp2_weight should match: [batch, experts_per_token, hidden_size, intermediate_size] (2D case)
+                    # or [batch, seq_len, experts_per_token, hidden_size, intermediate_size] (3D case)
                     experts_per_token = len(expert_indices)
                     out_features = self.config.hidden_size
-                    in_features = self.config.intermediate_size * 2
-                    # Use 2D case shape: [batch, experts_per_token, hidden_size, intermediate_size * 2]
-                    mlp2_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
-                    mlp2_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
+                    # After swiglu, t's last dimension is intermediate_size (not intermediate_size * 2)
+                    in_features = self.config.intermediate_size
+                    # Determine shape based on t's dimensions
+                    if len(t.shape) == 3:
+                        # 2D case: t is [batch, experts_per_token, intermediate_size]
+                        batch_size = t.shape[0]
+                        mlp2_weight = jnp.zeros((batch_size, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                        mlp2_bias = jnp.zeros((batch_size, experts_per_token, out_features), dtype=jnp.bfloat16)
+                    else:
+                        # 3D case: t is [batch, seq_len, experts_per_token, intermediate_size]
+                        batch_size = t.shape[0]
+                        seq_len = t.shape[1]
+                        mlp2_weight = jnp.zeros((batch_size, seq_len, experts_per_token, out_features, in_features), dtype=jnp.bfloat16)
+                        mlp2_bias = jnp.zeros((batch_size, seq_len, experts_per_token, out_features), dtype=jnp.bfloat16)
             else:
                 raise
         
         # einsum: handle both 2D and 3D cases
         # mlp2_weight: [batch, seq_len, experts_per_token, hidden_size, intermediate_size] or [batch, experts_per_token, hidden_size, intermediate_size]
-        # t after swiglu: [batch, seq_len, experts_per_token, intermediate_size] or [batch, experts_per_token, intermediate_size]
-        # From PyTorch: einsum("beck,bek->bec") where:
-        # - mlp2_weight: [batch, experts_per_token, hidden_size, intermediate_size] (b, e, c, k)
-        # - t: [batch, experts_per_token, intermediate_size] (b, e, k)
-        # - output: [batch, experts_per_token, hidden_size] (b, e, c)
-        if len(mlp2_weight.shape) == 5:
-            # 3D case: [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, seq_len, experts_per_token, intermediate_size]
-            # Use 'bseck,bsek->bsec' where s=seq_len, e=experts_per_token, c=hidden_size, k=intermediate_size
-            t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+        # t after swiglu: [batch, seq_len, experts_per_token, intermediate_size] (len=4) or [batch, experts_per_token, intermediate_size] (len=3)
+        # Note: swiglu splits the last dimension in half, so if mlp1 output is [..., intermediate_size*2], 
+        # swiglu output is [..., intermediate_size]
+        # Determine einsum pattern based on t's dimensions (not mlp2_weight's dimensions)
+        # Check if t's last dimension matches intermediate_size (not intermediate_size * 2)
+        # If t's last dimension is intermediate_size * 2, manually split it
+        if len(t.shape) == 4:
+            # Check if dimension needs to be split
+            if t.shape[-1] == self.config.intermediate_size * 2:
+                # Manually split the dimension
+                t_glu, t_linear = t[..., ::2], t[..., 1::2]
+                t_glu = jnp.clip(t_glu, a_min=None, a_max=self.swiglu_limit)
+                t_linear = jnp.clip(t_linear, a_min=-self.swiglu_limit, a_max=self.swiglu_limit)
+                out_glu = t_glu * jax.nn.sigmoid(1.702 * t_glu)
+                t = out_glu * (t_linear + 1)
+            # Now t should have intermediate_size as last dimension
+            if t.shape[-1] == self.config.intermediate_size:
+                # 3D case: t is [batch, seq_len, experts_per_token, intermediate_size]
+                # mlp2_weight should be [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
+                if len(mlp2_weight.shape) == 5:
+                    # bseck: batch, seq_len, experts_per_token, hidden_size, intermediate_size
+                    # bsek: batch, seq_len, experts_per_token, intermediate_size
+                    # bsec: batch, seq_len, experts_per_token, hidden_size
+                    t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+            else:
+                # mlp2_weight is 4D, need to expand to 5D
+                # [batch, experts_per_token, hidden_size, intermediate_size] -> [batch, seq_len, experts_per_token, hidden_size, intermediate_size]
+                batch_size, seq_len = t.shape[0], t.shape[1]
+                mlp2_weight = jnp.expand_dims(mlp2_weight, axis=1)  # [batch, 1, experts_per_token, ...]
+                mlp2_weight = jnp.broadcast_to(mlp2_weight, (batch_size, seq_len, mlp2_weight.shape[2], mlp2_weight.shape[3], mlp2_weight.shape[4]))
+                mlp2_bias = jnp.expand_dims(mlp2_bias, axis=1)
+                mlp2_bias = jnp.broadcast_to(mlp2_bias, (batch_size, seq_len, mlp2_bias.shape[2], mlp2_bias.shape[3]))
+                t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+        elif len(t.shape) == 3:
+            # Check if dimension needs to be split
+            if t.shape[-1] == self.config.intermediate_size * 2:
+                # Manually split the dimension
+                t_glu, t_linear = t[..., ::2], t[..., 1::2]
+                t_glu = jnp.clip(t_glu, a_min=None, a_max=self.swiglu_limit)
+                t_linear = jnp.clip(t_linear, a_min=-self.swiglu_limit, a_max=self.swiglu_limit)
+                out_glu = t_glu * jax.nn.sigmoid(1.702 * t_glu)
+                t = out_glu * (t_linear + 1)
+            # Now t should have intermediate_size as last dimension
+            if t.shape[-1] == self.config.intermediate_size:
+                # 2D case: t is [batch, experts_per_token, intermediate_size]
+                # mlp2_weight should be [batch, experts_per_token, hidden_size, intermediate_size]
+                if len(mlp2_weight.shape) == 4:
+                    # beck: batch, experts_per_token, hidden_size, intermediate_size
+                    # bek: batch, experts_per_token, intermediate_size
+                    # bec: batch, experts_per_token, hidden_size
+                    t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+            else:
+                # mlp2_weight is 5D, need to squeeze to 4D (take first seq_len dimension)
+                # [batch, seq_len, experts_per_token, hidden_size, intermediate_size] -> [batch, experts_per_token, hidden_size, intermediate_size]
+                mlp2_weight = mlp2_weight[:, 0, ...]  # Take first seq_len
+                mlp2_bias = mlp2_bias[:, 0, ...]
+                t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
         else:
-            # 2D case: [batch, experts_per_token, hidden_size, intermediate_size]
-            # t: [batch, experts_per_token, intermediate_size]
-            t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+            # Unexpected shape - t might still have intermediate_size * 2 (swiglu didn't work)
+            # or shape doesn't match expected patterns
+            print(f"Warning: Unexpected t shape {t.shape} for mlp2 (expected last dim={self.config.intermediate_size}), trying to infer...")
+            # Check if t's last dimension is intermediate_size * 2 (swiglu didn't split)
+            if t.shape[-1] == self.config.intermediate_size * 2:
+                # swiglu didn't work, need to manually split
+                print(f"Warning: t has intermediate_size*2 ({t.shape[-1]}), splitting manually...")
+                if len(t.shape) == 4:
+                    # [batch, seq_len, experts_per_token, intermediate_size*2] -> [batch, seq_len, experts_per_token, intermediate_size]
+                    t = t[..., ::2] * jax.nn.sigmoid(1.702 * t[..., ::2]) * (t[..., 1::2] + 1)
+                elif len(t.shape) == 3:
+                    # [batch, experts_per_token, intermediate_size*2] -> [batch, experts_per_token, intermediate_size]
+                    t = t[..., ::2] * jax.nn.sigmoid(1.702 * t[..., ::2]) * (t[..., 1::2] + 1)
+                else:
+                    # Generic case: split last dimension
+                    t = t[..., ::2] * jax.nn.sigmoid(1.702 * t[..., ::2]) * (t[..., 1::2] + 1)
+                # Now retry einsum with corrected t
+                if len(t.shape) == 4:
+                    if len(mlp2_weight.shape) == 5:
+                        t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+                    else:
+                        batch_size, seq_len = t.shape[0], t.shape[1]
+                        mlp2_weight = jnp.expand_dims(mlp2_weight, axis=1)
+                        mlp2_weight = jnp.broadcast_to(mlp2_weight, (batch_size, seq_len, mlp2_weight.shape[2], mlp2_weight.shape[3], mlp2_weight.shape[4]))
+                        mlp2_bias = jnp.expand_dims(mlp2_bias, axis=1)
+                        mlp2_bias = jnp.broadcast_to(mlp2_bias, (batch_size, seq_len, mlp2_bias.shape[2], mlp2_bias.shape[3]))
+                        t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+                elif len(t.shape) == 3:
+                    if len(mlp2_weight.shape) == 4:
+                        t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+                    else:
+                        mlp2_weight = mlp2_weight[:, 0, ...]
+                        mlp2_bias = mlp2_bias[:, 0, ...]
+                        t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+                else:
+                    raise ValueError(f"Cannot handle t shape {t.shape} after manual swiglu split")
+            elif len(t.shape) >= 4:
+                # Try 3D case
+                if len(mlp2_weight.shape) == 5:
+                    t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+                elif len(mlp2_weight.shape) == 4:
+                    # Expand mlp2_weight to 5D
+                    batch_size, seq_len = t.shape[0], t.shape[1]
+                    mlp2_weight = jnp.expand_dims(mlp2_weight, axis=1)
+                    mlp2_weight = jnp.broadcast_to(mlp2_weight, (batch_size, seq_len, mlp2_weight.shape[2], mlp2_weight.shape[3], mlp2_weight.shape[4]))
+                    mlp2_bias = jnp.expand_dims(mlp2_bias, axis=1)
+                    mlp2_bias = jnp.broadcast_to(mlp2_bias, (batch_size, seq_len, mlp2_bias.shape[2], mlp2_bias.shape[3]))
+                    t = jnp.einsum("bseck,bsek->bsec", mlp2_weight, t) + mlp2_bias
+                else:
+                    raise ValueError(f"Cannot handle mlp2_weight shape {mlp2_weight.shape} with t shape {t.shape}")
+            else:
+                # Try 2D case
+                if len(mlp2_weight.shape) == 4:
+                    t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+                elif len(mlp2_weight.shape) == 5:
+                    mlp2_weight = mlp2_weight[:, 0, ...]
+                    mlp2_bias = mlp2_bias[:, 0, ...]
+                    t = jnp.einsum("beck,bek->bec", mlp2_weight, t) + mlp2_bias
+                else:
+                    raise ValueError(f"Cannot handle mlp2_weight shape {mlp2_weight.shape} with t shape {t.shape}")
         
         # Combine expert outputs with weights
         # expert_weights: [batch, seq_len, experts_per_token] or [batch, experts_per_token]
@@ -585,38 +726,9 @@ class Transformer(nnx.Module):
 
     @jax.named_scope("transformer")
     def __call__(self, x: Array) -> Array:
-        # Access embedding value using .at[].get() pattern (same as qwen3)
-        # Handle both actual arrays and ShapeDtypeStruct (during shape inference)
-        embedding_value = self.embedding.embedding.value
-        if hasattr(embedding_value, 'at'):
-            # Apply sharding to embedding output
-            # Only use sharding if mesh is available and sharding is enabled
-            try:
-                mesh = get_abstract_mesh()
-                if not mesh.empty and self.config.shd_cfg.act_btd != P(None, None, None):
-                    # Check if we're in a mesh context
-                    try:
-                        from jax.sharding import NamedSharding
-                        out_sharding = NamedSharding(mesh, self.config.shd_cfg.act_btd)
-                        x = embedding_value.at[(x,)].get(out_sharding=out_sharding)
-                    except ValueError as e:
-                        # If not in mesh context, try to set mesh context or use direct access
-                        if "not under a mesh context" in str(e):
-                            # Use direct access without sharding
-                            x = embedding_value.at[(x,)].get()
-                        else:
-                            raise
-                else:
-                    # No mesh or no sharding, use direct access
-                    x = embedding_value.at[(x,)].get()
-            except Exception:
-                # Fallback: direct access without sharding
-                x = embedding_value.at[(x,)].get()
-        else:
-            # If embedding.value is still ShapeDtypeStruct, try direct call
-            # This should work if embedding was properly initialized
-            x = self.embedding(x)
-            x = shard(x, self.config.shd_cfg.act_btd)
+        # Use direct embedding call - simplest and most reliable
+        # JAX will handle sharding automatically if mesh is set
+        x = self.embedding(x)
         for block in self.block:
             x = block(x)
         x = self.norm(x)

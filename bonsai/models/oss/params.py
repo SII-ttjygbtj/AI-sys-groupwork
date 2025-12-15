@@ -427,7 +427,7 @@ def create_model_from_checkpoint(
                     conversion_errors.append(
                         f"Failed to assign '{torch_key}' to '{full_jax_key}': {type(e).__name__}: {e}"
                     )
-        gc.collect()
+    gc.collect()
 
     # Merge Q, K, V into QKV and assign
     for layer_idx, qkv_dict in qkv_weights.items():
@@ -607,5 +607,5 @@ def create_model_from_checkpoint(
     # Reconstruct model from state_dict (pure dict)
     # Use nnx.merge with state_dict directly (like qwen3)
     model = nnx.merge(graph_def, state_dict)
-    
+
     return model
